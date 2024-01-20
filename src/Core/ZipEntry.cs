@@ -145,7 +145,7 @@ public class ZipEntry
 
 #if UNIX
         // Since we're running on Unix, we need to set default permissions
-        if (entry.Data._attributeCompatibility is not AttributeCompatibility.UNIX)
+        if (entry._data._attributeCompatibility is not AttributeCompatibility.UNIX)
         {
             // Set permissions based on whether we've got a file or a directory
             entry.UnixFileMode = entry.IsDirectory ? DefaultDirectoryPermissions : DefaultFilePermissions;
@@ -269,7 +269,7 @@ public class ZipEntry
         _data._versionRequiredToExtract = (short)(_data._compressionMethod is CompressionMethod.Deflate ? 20 : 10);
 
 #if UNIX
-        Data._attributeCompatibility = AttributeCompatibility.UNIX;
+        _data._attributeCompatibility = AttributeCompatibility.UNIX;
 #else
         _data._attributeCompatibility = AttributeCompatibility.MSDOS;
 #endif
