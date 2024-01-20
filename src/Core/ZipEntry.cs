@@ -282,7 +282,7 @@ public class ZipEntry
         _data._extraFieldLength = 0;
     }
 
-    internal unsafe void WriteLocalHeader(Stream stream)
+    internal void WriteLocalHeader(Stream stream)
     {
         LocalFileHeader header = new()
         {
@@ -305,7 +305,7 @@ public class ZipEntry
         Debug.Assert(_data._extraFieldLength == 0, "Not accounting for extra fields");
     }
 
-    internal static unsafe void ReadAndSkipOverLocalFileHeader(Stream stream)
+    internal static void ReadAndSkipOverLocalFileHeader(Stream stream)
     {
         LocalFileHeader header = default;
         stream.Read(ref header);
