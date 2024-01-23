@@ -52,8 +52,7 @@ public class ZipArchive
         _buffer.Read(ref _endOfCentralDirectory);
 
         // If the EOCD tag doesn't match, this probably isn't a zip archive at all
-        if (_endOfCentralDirectory._tag != EndOfCentralDirectory.Tag)
-            throw new InvalidZipException();
+        ZipException.Assert(_endOfCentralDirectory._tag == EndOfCentralDirectory.Tag, ZipExceptionType.InvalidZip);
 
         // Parse Central Directories
         Entries = new(_endOfCentralDirectory._numEntriesTotal);
@@ -79,11 +78,11 @@ public class ZipArchive
     {
         foreach (var entry in Entries)
         {
-            if ((entry._data._generalPurposeFlag & GeneralPurposeFlags.Encrypted) != 0)
-                throw new EncryptedEntriesException();
+            // Throw if entry is encrypted
+            ZipException.Assert(!entry.IsEncrypted, ZipExceptionType.EncryptedEntries);
 
-            if (entry._data._compressionMethod is not (CompressionMethod.Deflate or CompressionMethod.None))
-                throw new UnsupportedCompressionException();
+            // Throw if entry uses an unsupported compression scheme
+            ZipException.Assert(entry._data._compressionMethod is (CompressionMethod.Deflate or CompressionMethod.None), ZipExceptionType.UnsupportedCompression);
 
             // We aren't checking CRCs here because it is too slow--files must be decompressed in order to calculate CRCs.
             // Delegate this and other expensive checks to ZipEntry.Extract()
@@ -221,7 +220,7 @@ public class ZipArchive
         UpdateEntries(saveEvent);
 
         string tempPath = $"{path}.temp";
-        using (var outputStream = File.Create(tempPath))
+        using (var outputStream = File.Create(tempPath, 8192, FileOptions.SequentialScan))
         {
             // Write out entry headers + data
             foreach (var entry in Entries)

@@ -1,10 +1,26 @@
 ﻿using System;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Zip.Core.Exceptions;
 
-public class ZipException(string? message = null) : Exception(message);
-public class InvalidZipException(string? message = null) : ZipException(message);
-public class MalformedZipException(string? message = null) : ZipException(message);
-public class UnsupportedCompressionException(string? message = null) : ZipException(message);
-public class EncryptedEntriesException(string? message = null) : ZipException(message);
-public class FailedCrcException(string? message = null) : ZipException(message);
+public enum ZipExceptionType
+{
+    InvalidZip,
+    MalformedZip,
+    UnsupportedCompression,
+    EncryptedEntries,
+    FailedCrc
+}
+
+public class ZipException(ZipExceptionType type) : Exception
+{
+    public ZipExceptionType Type { get; private set; } = type;
+
+    [DoesNotReturn]
+    private static void Throw(ZipExceptionType type) => throw new ZipException(type);
+
+    public static void Assert(bool expression, ZipExceptionType type)
+    {
+        if (!expression) Throw(type);
+    }
+}

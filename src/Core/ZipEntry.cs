@@ -46,6 +46,7 @@ public class ZipEntry
         set => _data._externalFileAttributesHigh = (ushort)((ushort)value & 0x0FFF);
     }
 
+    public bool IsEncrypted => (FileAttributes & FileAttributes.Encrypted) != 0;
     public bool IsDirectory => (FileAttributes & FileAttributes.Directory) != 0;
 
     internal bool WantsUpdate => PathToUpdatedContents is not null;
@@ -119,8 +120,7 @@ public class ZipEntry
         var entry = new ZipEntry(archive);
         archive._buffer.Read(ref entry._data);
 
-        if (entry._data._tag != CentralDirectory.Tag)
-            throw new MalformedZipException();
+        ZipException.Assert(entry._data._tag == CentralDirectory.Tag, ZipExceptionType.MalformedZip);
 
         entry._name = archive._buffer.ReadString(entry._data._fileNameLength);
         entry._comment = archive._buffer.ReadString(entry._data._fileCommentLength);
