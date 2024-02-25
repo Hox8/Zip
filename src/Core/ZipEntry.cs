@@ -278,6 +278,14 @@ public class ZipEntry
             ? GeneralPurposeFlags.None
             : GeneralPurposeFlags.UTF8Encoded;
 
+#if UNIX
+        // Set directory bit for Unix zips
+        if ((FileAttributes & FileAttributes.Directory) != 0)
+        {
+            _data._externalFileAttributesHigh |= (4 << 12);
+        }
+#endif
+
         // Extra fields are out of scope for now. We're tossing any we come across
         _data._extraFieldLength = 0;
     }
