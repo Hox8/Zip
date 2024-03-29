@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Zip.Core;
@@ -19,6 +20,7 @@ public class ZipArchive
     public readonly List<ZipEntry> Entries;
     internal readonly List<ZipEntry> _entriesToUpdate = [];
     private EndOfCentralDirectory _endOfCentralDirectory;
+    private string? _comment;
 
     public const ZipVersion Version = ZipVersion.COMPRESS_Deflate;
 
@@ -47,12 +49,41 @@ public class ZipArchive
     {
         _buffer = stream;
 
+        // Zip archive must be big enough to store at least the EOCD
+        ZipException.Assert(_buffer.Length >= sizeof(EndOfCentralDirectory), ZipExceptionType.InvalidZip);
+
         // Parse end of Central Directory
         _buffer.Position = _buffer.Length - sizeof(EndOfCentralDirectory);
         _buffer.Read(ref _endOfCentralDirectory);
 
-        // If the EOCD tag doesn't match, this probably isn't a zip archive at all
-        ZipException.Assert(_endOfCentralDirectory._tag == EndOfCentralDirectory.Tag, ZipExceptionType.InvalidZip);
+        // If tag doesn't match, the zip archive could be using a zip comment
+        if (_endOfCentralDirectory._tag != EndOfCentralDirectory.Tag)
+        {
+            // Brute force check the last 64KB (ushort; maximum comment size)
+            _buffer.Position = Math.Max(0, _buffer.Length - ushort.MaxValue);
+
+            // Crawl until we hit EOF - 4, or we find signature
+            while (_buffer.Position < _buffer.Length - 4 && !(
+                _buffer.ReadByte() == EndOfCentralDirectory.Tag0 &&
+                _buffer.ReadByte() == EndOfCentralDirectory.Tag1 &&
+                _buffer.ReadByte() == EndOfCentralDirectory.Tag2 &&
+                _buffer.ReadByte() == EndOfCentralDirectory.Tag3)) ;
+
+            // Try read EOCD again if we didn't hit EOF
+            if (_buffer.Position + sizeof(EndOfCentralDirectory) <= _buffer.Length)
+            {
+                _buffer.Position -= 4;
+                _buffer.Read(ref _endOfCentralDirectory);
+
+                _comment = _buffer.ReadString(_endOfCentralDirectory._commentLength);
+            }
+
+            // If the EOCD tag still doesn't match, this isn't a valid zip archive
+            ZipException.Assert(_endOfCentralDirectory._tag == EndOfCentralDirectory.Tag, ZipExceptionType.InvalidZip);
+        }
+
+        // Make sure this zip archive is actually big enough to store these records
+        ZipException.Assert(_buffer.Length >= _endOfCentralDirectory._centralDirectoryOffset + _endOfCentralDirectory._centralDirectorySize, ZipExceptionType.InvalidZip);
 
         // Parse Central Directories
         Entries = new(_endOfCentralDirectory._numEntriesTotal);
@@ -280,11 +311,19 @@ public class ZipArchive
                 }
             }
 
-            // Write end of central directory
+            // Update and write end of central directory
             _endOfCentralDirectory._centralDirectorySize = (int)outputStream.Position - _endOfCentralDirectory._centralDirectoryOffset;
             _endOfCentralDirectory._numEntriesTotal = (short)Entries.Count;
             _endOfCentralDirectory._numEntriesOnDisk = _endOfCentralDirectory._numEntriesTotal;
+            _endOfCentralDirectory._commentLength = (ushort)Encoding.UTF8.GetByteCount(_comment ?? "");
+
             outputStream.Write(_endOfCentralDirectory);
+
+            // Write out zip comment if we have one set
+            if (_endOfCentralDirectory._commentLength > 0)
+            {
+                outputStream.WriteString(_comment);
+            }
         }
 
         // Let saveEvent know we're finished

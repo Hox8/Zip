@@ -34,6 +34,13 @@ internal record struct EndOfCentralDirectory
 {
     public const int Tag = 0x06054b50;
 
+    // These are used when we need to do a brute force
+    // search for the EndOfCentralDirectory in case of a zip comment
+    public const byte Tag0 = Tag & 0xFF;
+    public const byte Tag1 = (Tag >> 8) & 0xFF;
+    public const byte Tag2 = (Tag >> 16) & 0xFF;
+    public const byte Tag3 = (Tag >> 24) & 0xFF;
+
     public int _tag;
     /// <summary>The number of this disk.</summary>
     public short _diskNumber;
@@ -48,5 +55,5 @@ internal record struct EndOfCentralDirectory
     /// <summary>Offset to the start of the Central Directory, relative to the current disk.</summary>
     public int _centralDirectoryOffset;
     /// <summary>Length of the following string comment field.</summary>
-    public short _commentLength;
+    public ushort _commentLength;
 }
