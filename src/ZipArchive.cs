@@ -1,39 +1,71 @@
-﻿using Force.Crc32;
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Compression;
-using System.Runtime.InteropServices;
+using System.IO.Hashing;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Zip.Core;
 using Zip.Core.Events;
 using Zip.Core.Exceptions;
-using static Zip.Shared;
+using static Zip.Core.ZipConstants;
 
 namespace Zip;
 
-public class ZipArchive
+public class ZipArchive : IDisposable
 {
-    internal FileStream _buffer;
-    public readonly List<ZipEntry> Entries;
-    internal readonly List<ZipEntry> _entriesToUpdate = [];
-    private EndOfCentralDirectory _endOfCentralDirectory;
-    private string? _comment;
-
     public const ZipVersion Version = ZipVersion.COMPRESS_Deflate;
 
-    #region Accessors
+    private EndOfCentralDirectory _data;
+    public readonly List<ZipEntry> Entries;
 
-    public string Name => _buffer.Name;
+    // This is used only when opening an existing zip archive.
+    // We keep this handle alive for the lifetime of this ZipArchive,
+    // which guarantees we can also refer to original ZipEntry data, and
+    // also allows us to reuse this handle when saving unmodified ZipEntries.
+    private readonly FileStream? _inputFile;
+
+    private bool _bIsDisposed;
+
+    #region Config
+
+    // The minimum acceptable compression ratio to use when compressing new files.
+    // If this is not met, files will be stored uncompressed regardless of compression settings.
+    public float MinimumAcceptableCompressionRatio = 0.9f;
+
+    // I'd like to support this, but I'll need to change how a few things work.
+    // public bool ForceFullRecompression;
 
     #endregion
 
     #region Events
 
-    public delegate void ProgressEventHandler(object sender, ZipProgressEventArgs e);
-    public event ProgressEventHandler ProgressChanged;
+    // ProgressChanged event for zip saving
+    public delegate void ZipSaveProgressEventHandler(ZipArchive sender, ZipSaveProgressEventArgs e);
+
+    /// <summary>
+    /// Occurs during save operations to report overall save progress.
+    /// </summary>
+    /// <remarks>
+    /// This event is fired each time a <see cref="ZipEntry"/> is compressed and/or written to disk.<br/>
+    /// Overall progress is weighted; see <see cref="ZipSaveProgressEventArgs"/> for details.
+    /// </remarks>
+    public event ZipSaveProgressEventHandler? ZipSaveProgressChanged;
+
+    #endregion
+
+    #region Accessors
+
+    // The last size of this zip archive file on-disk.
+    public long Size { get; private set; }
+
+    public string Comment { get; set; } = "";
+
+    public bool HasValidComment() => Comment.Length > 0;
 
     #endregion
 
@@ -42,91 +74,207 @@ public class ZipArchive
     private ZipArchive()
     {
         Entries = [];
-        _endOfCentralDirectory = new EndOfCentralDirectory { _tag = EndOfCentralDirectory.Tag };
+        _data = new EndOfCentralDirectory();
     }
 
-    public unsafe ZipArchive(FileStream stream)
+    private unsafe ZipArchive(FileStream stream)
     {
-        _buffer = stream;
+        // We are taking ownership of the stream
+        _inputFile = stream;
+
+        Size = stream.Length;
 
         // Zip archive must be big enough to store at least the EOCD
-        ZipException.Assert(_buffer.Length >= sizeof(EndOfCentralDirectory), ZipExceptionType.InvalidZip);
+        ZipException.Assert(stream.Length >= sizeof(EndOfCentralDirectory), ZipExceptionType.InvalidZip);
 
-        // Parse end of Central Directory
-        _buffer.Position = _buffer.Length - sizeof(EndOfCentralDirectory);
-        _buffer.Read(ref _endOfCentralDirectory);
+        // Parse the End of Central Directory
+        stream.Position = stream.Length - sizeof(EndOfCentralDirectory);
+        stream.Read(ref _data);
 
         // If tag doesn't match, the zip archive could be using a zip comment
-        if (_endOfCentralDirectory._tag != EndOfCentralDirectory.Tag)
+        if (_data._tag != EndOfCentralDirectory.Tag)
         {
             // Brute force check the last 64KB (ushort; maximum comment size)
-            _buffer.Position = Math.Max(0, _buffer.Length - ushort.MaxValue);
+            stream.Position = Math.Max(0, stream.Length - ushort.MaxValue);
 
             // Crawl until we hit EOF - 4, or we find signature
-            while (_buffer.Position < _buffer.Length - 4 && !(
-                _buffer.ReadByte() == EndOfCentralDirectory.Tag0 &&
-                _buffer.ReadByte() == EndOfCentralDirectory.Tag1 &&
-                _buffer.ReadByte() == EndOfCentralDirectory.Tag2 &&
-                _buffer.ReadByte() == EndOfCentralDirectory.Tag3)) ;
+            while (stream.Position < stream.Length - sizeof(int) && !(
+                   stream.ReadByte() == EndOfCentralDirectory.Tag0 &&
+                   stream.ReadByte() == EndOfCentralDirectory.Tag1 &&
+                   stream.ReadByte() == EndOfCentralDirectory.Tag2 &&
+                   stream.ReadByte() == EndOfCentralDirectory.Tag3) );
 
             // Try read EOCD again if we didn't hit EOF
-            if (_buffer.Position + sizeof(EndOfCentralDirectory) <= _buffer.Length)
+            if (stream.Position + sizeof(EndOfCentralDirectory) <= stream.Length)
             {
-                _buffer.Position -= 4;
-                _buffer.Read(ref _endOfCentralDirectory);
+                stream.Position -= sizeof(int);
+                stream.Read(ref _data);
 
-                _comment = _buffer.ReadString(_endOfCentralDirectory._commentLength);
+                Comment = stream.ReadString(_data._commentLength);
             }
 
             // If the EOCD tag still doesn't match, this isn't a valid zip archive
-            ZipException.Assert(_endOfCentralDirectory._tag == EndOfCentralDirectory.Tag, ZipExceptionType.InvalidZip);
+            ZipException.Assert(_data._tag == EndOfCentralDirectory.Tag, ZipExceptionType.InvalidZip);
         }
 
         // Make sure this zip archive is actually big enough to store these records
-        ZipException.Assert(_buffer.Length >= _endOfCentralDirectory._centralDirectoryOffset + _endOfCentralDirectory._centralDirectorySize, ZipExceptionType.InvalidZip);
+        ZipException.Assert(stream.Length >= _data._centralDirectoryOffset + _data._centralDirectorySize, ZipExceptionType.InvalidZip);
 
         // Parse Central Directories
-        Entries = new(_endOfCentralDirectory._numEntriesTotal);
-        _buffer.Position = _endOfCentralDirectory._centralDirectoryOffset;
+        Entries = new List<ZipEntry>(_data._numEntriesTotal);
+        stream.Position = _data._centralDirectoryOffset;
 
         for (int i = 0; i < Entries.Capacity; i++)
         {
-            Entries.Add(ZipEntry.ReadFromArchive(this));
+            Entries.Add(ZipEntry.FromStream(stream));
         }
-
-        CheckForUnsupportedEntries();
     }
 
-    public static ZipArchive Read(FileStream stream) => new(stream);
     public static ZipArchive Create() => new();
+    public static ZipArchive FromFile(string filePath) => new(File.OpenRead(filePath));
+    public static ZipArchive FromFile(FileStream fileStream) => new(fileStream);
 
     #endregion
 
-    #region Internal methods
+    #region IO
 
-    // Placeholder
-    private void CheckForUnsupportedEntries()
+    /// <summary>
+    /// Saves the <see cref="ZipArchive"/> to the specified file path, compressing any entries marked for update.
+    /// </summary>
+    /// <param name="zipPath">The file path where the <see cref="ZipArchive"/> will be saved. If the file exists, it will be overwritten.</param>
+    public unsafe void SaveToFile(string zipPath)
     {
-        foreach (var entry in Entries)
+        // Tally up sizes to set up progress events
+
+        long totalBytesToWrite = 0;
+        long totalBytesToCompress = 0;
+
+        // Construct a fresh list of entries wanting updates here.
+        List<ZipEntry> entriesWantingUpdates = [];
+
+        foreach (var entry in Entries.AsSpan())
         {
-            // Throw if entry is encrypted
-            ZipException.Assert(!entry.IsEncrypted, ZipExceptionType.EncryptedEntries);
+            if (EntryWantsUpdate(entry))
+            {
+                // We don't know what the compressed size is at this point, so just use the uncompressed size
+                long uncompressedSize = entry.FileData.WantsOriginalData()
+                    ? entry.UncompressedSize
+                    : new FileInfo(entry.FileData.GetPath()).Length;
 
-            // Throw if entry uses an unsupported compression scheme
-            ZipException.Assert(entry._data._compressionMethod is (CompressionMethod.Deflate or CompressionMethod.None), ZipExceptionType.UnsupportedCompression);
+                totalBytesToCompress += uncompressedSize;
+                totalBytesToWrite += uncompressedSize;
 
-            // We aren't checking CRCs here because it is too slow--files must be decompressed in order to calculate CRCs.
-            // Delegate this and other expensive checks to ZipEntry.Extract()
+                entriesWantingUpdates.Add(entry);
+            }
+            else
+            {
+                // For simplicity, we'll tally the uncompressed size regardless of any existing compression
+                totalBytesToWrite += entry.UncompressedSize;
+            }
         }
+
+        // A central directory record needs to be written for every entry present, which represents a small but quantifiable unit of work.
+        // We approximate this workload ahead of time by making it attribute to 1% of the overall progress (affected by weighting, so this may end up being smaller than 1%)
+        int onePercentOfTotal = (int)(totalBytesToWrite / 100.0f);
+
+        ZipSaveProgressEventArgs saveEvent = new(totalBytesToWrite + onePercentOfTotal, totalBytesToCompress);
+
+        // Use a temporary path to store any intermediate files
+        string tempFolderPath = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolderPath);
+
+        // Compress and calculate CRCs for all entries queued for update
+        UpdateEntriesInternal(entriesWantingUpdates, saveEvent, tempFolderPath);
+
+        // Now, write the zip archive to disk
+        string tempZipPath = Path.Combine(tempFolderPath, Path.GetRandomFileName());
+        using (var outStream = File.Create(tempZipPath, BufferSize, FileOptions.SequentialScan))
+        {
+            // Write out entries
+            foreach (var entry in Entries.AsSpan())
+            {
+                // Update entry values, and write out its local header
+                entry.CacheValuesForSave(outStream);
+                entry.WriteLocalHeader(outStream);
+
+                // Write any entry data
+                if (entry.FileData.HasData())
+                {
+                    // Should we re-use existing data?
+                    if (entry.FileData.WantsOriginalData())
+                    {
+                        // Yes. As an optimization, we can reuse our persistent handle.
+                        // Copy the relevant data at the entry's offset
+                        _inputFile!.Position = entry.FileData.OriginalOffset;
+                        _inputFile.ConstrainedCopy(outStream, entry.CompressedSize);
+                    }
+                    else
+                    {
+                        // Using RandomAccess over FileStream to reduce allocations, as this can be called many, many times
+                        using var handle = File.OpenHandle(entry.FileData.GetTempPath(), FileMode.Open, FileAccess.Read, FileShare.Read, FileOptions.SequentialScan);
+
+                        handle.ConstrainedCopy(outStream, entry.CompressedSize, 0);
+                    }
+                }
+
+                // Progress event
+                saveEvent.CurrentBytesWritten += entry.UncompressedSize;
+                ZipSaveProgressChanged?.Invoke(this, saveEvent);
+            }
+
+            // Write out central directories
+
+            _data._centralDirectoryOffset = (int)outStream.Position;
+
+            foreach (var entry in Entries.AsSpan())
+            {
+                entry.WriteCentralDirectory(outStream);
+            }
+
+            // Update and write end of central directory
+            _data._centralDirectorySize = (int)outStream.Position - _data._centralDirectoryOffset;
+            _data._numEntriesTotal = (short)Entries.Count;
+            _data._numEntriesOnDisk = _data._numEntriesTotal;
+            _data._commentLength = (ushort)Encoding.UTF8.GetByteCount(Comment);
+
+            outStream.Write(ref _data);
+
+            if (HasValidComment())
+            {
+                outStream.WriteString(Comment);
+            }
+
+            // Update our size
+            Size = outStream.Length;
+        }
+
+        // Verify our progress has progressed as expected
+        Debug.Assert(saveEvent.CurrentBytesCompressed == saveEvent.TotalBytesToCompress);
+        Debug.Assert(saveEvent.CurrentBytesWritten + onePercentOfTotal == saveEvent.TotalBytesToWrite);
+
+        // We're finished. Set our current stats to their totals and broadcast one last time
+        saveEvent.CurrentBytesWritten = saveEvent.TotalBytesToWrite;
+        ZipSaveProgressChanged?.Invoke(this, saveEvent);
+
+        // Move the temp zip to its destination
+        File.Move(tempZipPath, zipPath, true);
+
+        // Clear out our temp folder
+        Directory.Delete(tempFolderPath, true);
     }
 
-    internal bool TryGetEntry(string entryName, out ZipEntry outEntry)
-    {
-        entryName = SanitizePath(entryName);
+    #endregion
 
-        foreach (var entry in Entries)
+    #region Public API
+
+    public bool TryGetEntry(string zipEntryPath, [NotNullWhen(true)] out ZipEntry? outEntry)
+    {
+        // Zip paths must use Unix path separator
+        zipEntryPath = zipEntryPath.Replace('\\', '/');
+
+        foreach (var entry in Entries.AsSpan())
         {
-            if (entry.Name.Equals(entryName, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(entry.Name, zipEntryPath, StringComparison.OrdinalIgnoreCase))
             {
                 outEntry = entry;
                 return true;
@@ -137,314 +285,111 @@ public class ZipArchive
         return false;
     }
 
-    internal static long TallySizeOfEntries(ReadOnlySpan<ZipEntry> entries)
+    public void UpdateEntry(string filePath, string zipPath)
     {
-        long total = 0;
-        for (int i = 0; i < entries.Length; i++)
+        if (!TryGetEntry(filePath, out ZipEntry? outEntry))
         {
-            total += entries[i].UncompressedSize;
+            outEntry = ZipEntry.Create(zipPath);
+            Entries.Add(outEntry);
         }
 
-        return total;
+        outEntry.UpdateContents(filePath);
     }
 
-    public static string SanitizePath(string path)
+    public void UpdateEntries(string directoryPath)
     {
-        // Replace any Windows slashes with Zip slashes
-        path = path.Replace('\\', '/');
-
-        // If path starts with directory separator, remove it
-        if (path.StartsWith('/')) path = path[1..];
-
-        // If path ends with directory separator, remove it
-        if (path.EndsWith('/')) path = path[..^1];
-
-        return path;
-    }
-
-    // Done in parallel. If we're compressing and CRC'ing 50 files, parallelization will speed this up greatly.
-    private void UpdateEntries(SaveProgressEventArgs saveEvent)
-    {
-        Parallel.ForEach(_entriesToUpdate, entry =>
+        foreach (var file in Directory.GetFiles(directoryPath, "*", SearchOption.AllDirectories))
         {
-            var uncompressed = new FileInfo(entry.PathToUpdatedContents);
-            var compressed = new FileInfo($"{entry.PathToUpdatedContents}.temp");
+            var zipPath = file.Substring(directoryPath.Length + 1);
 
-            using (var sourceStream = uncompressed.OpenRead())
-            {
-                entry.UncompressedSize = (int)sourceStream.Length;
-
-                // Calculate Crc of the uncompressed file
-                entry._data._crc32 = Crc32Algorithm.Compute(sourceStream, entry.UncompressedSize);
-                sourceStream.Position = 0;
-
-                // Compress the file
-                using var outputStream = compressed.Create();
-                using (var compressStream = new DeflateStream(outputStream, entry.CompressionLevel, true))
-                {
-                    sourceStream.CopyTo(compressStream);
-                }
-
-                entry.CompressedSize = (int)outputStream.Position;
-            }
-
-            // Poll file attributes
-            entry.LastFileTime = uncompressed.LastWriteTime;
-            entry.FileAttributes = uncompressed.Attributes;
-#if UNIX
-            entry.UnixFileMode = uncompressed.UnixFileMode;
-#endif
-
-            // We can't modify the input file (that would be bad design), so:
-            // - If the compression was beneficial, point the entry's path to the temp file. We'll delete it later
-            // - If the compression wasn't beneficial, simply delete the temp file and use the original uncompressed
-            if (entry.CompressedSize < entry.UncompressedSize)
-            {
-                entry.PathToUpdatedContents = compressed.FullName;
-                entry.CompressionMethod = CompressionMethod.Deflate;
-            }
-            else
-            {
-                compressed.Delete();
-                entry.CompressedSize = entry.UncompressedSize;
-                entry.CompressionMethod = CompressionMethod.None;
-            }
-
-            Interlocked.Add(ref saveEvent._bytesCompressed, entry.UncompressedSize);
-            Interlocked.Add(ref saveEvent.ProcessedBytes, entry.UncompressedSize);
-            ProgressChanged?.Invoke(this, saveEvent);
-        });
+            UpdateEntry(file, zipPath);
+        }
     }
 
     #endregion
 
-    public void Save(string path)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool EntryWantsUpdate(ZipEntry entry) => /*ForceFullRecompression ||*/ !entry.FileData.WantsOriginalData();
+
+    // Called by Save(). Updates all entries requesting new data
+    private void UpdateEntriesInternal(List<ZipEntry> entries, ZipSaveProgressEventArgs saveEvent, string tempPath)
     {
-        long totalBytesToWrite = 0;
-        long totalBytesToCompress = 0;
-
-        _buffer ??= File.Create(path);
-
-        foreach (var entry in Entries)
-        {
-            if (entry.WantsUpdate)
-            {
-                // We don't know what the compressed size will be ahead of time, so just use the uncompressed size
-                long uncompressedSize = new FileInfo(entry.PathToUpdatedContents).Length;
-                totalBytesToCompress += uncompressedSize;
-                totalBytesToWrite += uncompressedSize;
-            }
-            else
-            {
-                // We'll reuse the entry's existing compression if it doesn't need updating
-                totalBytesToWrite += entry.CompressedSize;
-            }
-        }
-
-        // A central directory record needs to be written for every entry present, which represents a small but quantifiable unit of work.
-        // We approximate this workload ahead of time by making it attribute to 1% of the overall progress (affected by weighting, so this may end up being smaller than 1%)
-        int onePercentOfTotal = (int)(totalBytesToWrite / 100f);
-
-        SaveProgressEventArgs saveEvent = new(totalBytesToWrite + onePercentOfTotal, totalBytesToCompress, 0);
-
-        // Compress and calculate CRCs for all entries queued for update
-        UpdateEntries(saveEvent);
-
-        string tempPath = $"{path}.temp";
-        using (var outputStream = File.Create(tempPath, 8192, FileOptions.SequentialScan))
-        {
-            // Write out entry headers + data
-            foreach (var entry in Entries)
-            {
-                // Position source buffer to start of data (after LFH)
-                _buffer.Position = entry._data._relativeOffsetOfLocalHeader;
-                ZipEntry.ReadAndSkipOverLocalFileHeader(_buffer);
-
-                // @TODO this is gross
-                entry.PrepareForSave();
-
-                // Update entry offset and write out its header
-                entry._data._relativeOffsetOfLocalHeader = (int)outputStream.Position;
-                entry.WriteLocalHeader(outputStream);
-
-                if (entry.WantsUpdate)
-                {
-                    // Copy data from new source to destination
-                    var newSource = new FileInfo(entry.PathToUpdatedContents);
-
-                    using (var newSourceReader = newSource.OpenRead())
-                    {
-                        newSourceReader.CopyTo(outputStream);
-                    }
-
-                    // If newSource is a temp compressed file, delete it now that we've finished using it
-                    if (entry.CompressionMethod is not CompressionMethod.None)
-                    {
-                        newSource.Delete();
-                    }
-                }
-                else
-                {
-                    // Copy old compressed data from source zip stream to destination
-                    _buffer.ConstrainedCopy(outputStream, entry.CompressedSize);
-                }
-
-                // Progress event
-                long entryBytes = entry.WantsUpdate ? entry.UncompressedSize : entry.CompressedSize;
-                saveEvent._bytesWritten += entryBytes;
-                saveEvent.ProcessedBytes += entryBytes;
-                ProgressChanged?.Invoke(this, saveEvent);
-            }
-
-            // Write out central directories
-
-            _endOfCentralDirectory._centralDirectoryOffset = (int)outputStream.Position;
-
-            foreach (var entry in Entries)
-            {
-                outputStream.Write(entry._data);
-                outputStream.WriteString(entry.Name);
-
-                if (entry.Comment is not null)
-                {
-                    outputStream.WriteString(entry.Comment);
-                }
-            }
-
-            // Update and write end of central directory
-            _endOfCentralDirectory._centralDirectorySize = (int)outputStream.Position - _endOfCentralDirectory._centralDirectoryOffset;
-            _endOfCentralDirectory._numEntriesTotal = (short)Entries.Count;
-            _endOfCentralDirectory._numEntriesOnDisk = _endOfCentralDirectory._numEntriesTotal;
-            _endOfCentralDirectory._commentLength = (ushort)Encoding.UTF8.GetByteCount(_comment ?? "");
-
-            outputStream.Write(_endOfCentralDirectory);
-
-            // Write out zip comment if we have one set
-            if (_endOfCentralDirectory._commentLength > 0)
-            {
-                outputStream.WriteString(_comment);
-            }
-        }
-
-        // Let saveEvent know we're finished
-        saveEvent._bytesWritten += onePercentOfTotal;
-        saveEvent.ProcessedBytes += onePercentOfTotal;
-        ProgressChanged?.Invoke(this, saveEvent);
-
-        _buffer?.Dispose();
-        File.Move(tempPath, path, true);
-    }
-
-    public ZipEntry? GetEntry(string entryName)
-    {
-        TryGetEntry(entryName, out ZipEntry entry);
-
-        return entry;
-    }
-
-    public void RemoveEntry(string entryName)
-    {
-        TryGetEntry(entryName, out ZipEntry entry);
-
-        if (entry is not null)
-        {
-            Entries.Remove(entry);
-        }
-    }
-
-    public void ExtractEntries(ZipEntry[] entries, string basePath)
-    {
-        ReadOnlySpan<ZipEntry> span = entries.AsSpan();
-        var extractArgs = new ExtractProgressEventArgs(TallySizeOfEntries(span), 0);
-
-        foreach (var entry in span)
-        {
-            entry.Extract(basePath);
-            extractArgs.ProcessedBytes += entry.UncompressedSize;
-
-            ProgressChanged?.Invoke(this, extractArgs);
-        }
-    }
-
-    public void ExtractEntries(List<ZipEntry> entries, string basePath)
-    {
-        ReadOnlySpan<ZipEntry> span = CollectionsMarshal.AsSpan(entries);
-        var extractArgs = new ExtractProgressEventArgs(TallySizeOfEntries(span), 0);
-
-        foreach (var entry in span)
-        {
-            entry.Extract(basePath);
-            extractArgs.ProcessedBytes += entry.UncompressedSize;
-
-            ProgressChanged?.Invoke(this, extractArgs);
-        }
-    }
-
-    public void ExtractEntriesParallel(ZipEntry[] entries, string basePath)
-    {
-        var extractArgs = new ExtractProgressEventArgs(TallySizeOfEntries(entries), 0);
-
         Parallel.ForEach(entries, entry =>
         {
-            entry.Extract(basePath);
+            // We assume the list passed to us has been filtered
+            Debug.Assert(!entry.FileData.WantsOriginalData());
 
-            Interlocked.Add(ref extractArgs.ProcessedBytes, entry.UncompressedSize);
-            ProgressChanged?.Invoke(this, extractArgs);
-        });
-    }
-    public void ExtractEntriesParallel(List<ZipEntry> entries, string basePath)
-    {
-        var extractArgs = new ExtractProgressEventArgs(TallySizeOfEntries(CollectionsMarshal.AsSpan(entries)), 0);
+            var newFile = new FileInfo(entry.FileData.GetPath());
+            var uncompressedStream = newFile.OpenRead();
 
-        Parallel.ForEach(entries, entry =>
-        {
-            entry.Extract(basePath);
+            // Poll file attributes
+            entry.LastFileTime = newFile.LastWriteTime;
+            entry.FileAttributes = newFile.Attributes;
+#if UNIX
+            entry.UnixFileMode = newFile.UnixFileMode;
+#endif
 
-            Interlocked.Add(ref extractArgs.ProcessedBytes, entry.UncompressedSize);
-            ProgressChanged?.Invoke(this, extractArgs);
+            entry.UncompressedSize = (int)uncompressedStream.Length;
+            entry.CompressedSize = entry.UncompressedSize;
+
+            // CRC
+            {
+                var crc32 = new Crc32();
+
+                crc32.Append(uncompressedStream);
+
+                entry.CRC32 = crc32.GetCurrentHashAsUInt32();
+            }
+
+            entry.FileData.SetTempPath(entry.FileData.GetPath());
+
+            // Compress
+            if (entry.CompressionMethod == CompressionMethod.Deflate &&
+                entry.CompressionLevel != CompressionLevel.NoCompression)
+            {
+                // Reset position since we will have consumed the full length for CRC
+                uncompressedStream.Position = 0;
+
+                using var compressedStream = File.Create(Path.Combine(tempPath, Path.GetRandomFileName()));
+                using (var deflator = new DeflateStream(compressedStream, entry.CompressionLevel, true))
+                {
+                    uncompressedStream.CopyTo(deflator);
+                }
+
+                // If we end up with 0 bytes, something must have gone wrong
+                Debug.Assert(compressedStream.Length > 0);
+
+                // Did we compress enough?
+                if ((double)compressedStream.Length / entry.UncompressedSize <= MinimumAcceptableCompressionRatio)
+                {
+                    // Point to the compressed file
+                    entry.FileData.SetTempPath(compressedStream.Name);
+
+                    entry.CompressedSize = (int)compressedStream.Length;
+                }
+            }
+
+            Interlocked.Add(ref saveEvent.CurrentBytesCompressed, entry.UncompressedSize);
+            ZipSaveProgressChanged?.Invoke(this, saveEvent);
         });
     }
 
-    /// <summary>
-    /// 
-    /// </summary>
-    /// <param name="diskPath">Disk path of the file to update the zip with.</param>
-    /// <param name="zipPath">The path inside the zip where the file will go.</param>
-    public void UpdateEntry(string diskPath, string zipPath)
+    protected virtual void Dispose(bool bIsDisposing)
     {
-        if (!TryGetEntry(zipPath, out ZipEntry entry))
+        if (!_bIsDisposed)
         {
-            entry = ZipEntry.CreateNew(this, zipPath);
-            Entries.Add(entry);
-        }
+            if (bIsDisposing)
+            {
+                _inputFile?.Dispose();
+            }
 
-        entry.Update(diskPath);
-    }
-
-    public void UpdateEntries(ZipEntry[] entries, string basePath = "")
-    {
-        foreach (var entry in entries)
-        {
-            entry.Update(basePath);
+            _bIsDisposed = true;
         }
     }
 
-    public void UpdateEntries(List<ZipEntry> entries, string basePath = "")
+    public void Dispose()
     {
-        foreach (var entry in entries)
-        {
-            entry.Update(basePath);
-        }
-    }
-
-    public void UpdateEntries(string directoryPath, string basePath = "")
-    {
-        int skipLength = Path.GetFullPath(directoryPath).Length + 1;
-
-        foreach (var file in Directory.EnumerateFiles(directoryPath, "*.*", SearchOption.AllDirectories))
-        {
-            string zipPath = Path.Combine(basePath, file[skipLength..]).Replace('\\', '/');
-            UpdateEntry(file, zipPath);
-        }
+        Dispose(true);
+        GC.SuppressFinalize(this);
     }
 }

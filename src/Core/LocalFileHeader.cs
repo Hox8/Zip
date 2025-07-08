@@ -1,9 +1,10 @@
 ﻿using System.Runtime.InteropServices;
-using static Zip.Shared;
+using static Zip.Core.ZipConstants;
 
 namespace Zip.Core;
 
-// These are mostly ignored in this library
+// LocalFileHeaders are not used by this library. They are written to
+// comply with the ZIP standard, but are otherwise completely ignored
 [StructLayout(LayoutKind.Sequential, Pack = 2)]
 internal record struct LocalFileHeader
 {

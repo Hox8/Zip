@@ -1,10 +1,16 @@
 ﻿using System;
 
-namespace Zip;
+namespace Zip.Core;
 
-public static class Shared
+public static class ZipConstants
 {
-    // These are all pretty messily dumped here
+    // @TODO enforce these
+    public const int MaxFileNameLength = ushort.MaxValue;
+    public const int MaxCommentLength = ushort.MaxValue;
+    public const int MaxExtraFieldLength = ushort.MaxValue;
+
+    // Buffer size used for various I/O operations
+    public const int BufferSize = 131072;
 
     public enum ZipVersion : byte
     {
@@ -14,31 +20,23 @@ public static class Shared
 
         FEATURE_Directory = 20,
         COMPRESS_Deflate = 20,
+
+        // The following are not supported by this library
+
         ENCRYPT_PKWare = 20,
-
-
         COMPRESS_Deflate64 = 21,
-
         COMPRESS_Implode = 25,
-
         FEATURE_PatchData = 27,
-
         FEATURE_Zip64 = 45,
-
         COMPRESS_BZip2 = 46,
-
         ENCRYPT_DES = 50,
         ENCRYPT_3DES = 50,
         ENCRYPT_RC2 = 50,
         ENCRYPT_RC4 = 50,
-
         ENCRYPT_AES = 51,
         ENCRYPT_RC2Fixed = 52,
-
         ENCRYPT_NonOAEP = 61,
-
         FEATURE_CentralDirectoryEncryption = 62,
-
         COMRPESS_LZMA = 63,
         COMPRESS_PPMd = 63,
         COMPRESS_Blowfish = 63,
@@ -75,7 +73,7 @@ public static class Shared
         ZeroedSizeStats = 1 << 3,
 
         /// <summary>
-        /// Reserved for use with method 8, for enhanced deflating. 
+        /// Reserved for use with method 8, for enhanced deflating.
         /// </summary>
         EnhancedDeflation = 1 << 4,
 

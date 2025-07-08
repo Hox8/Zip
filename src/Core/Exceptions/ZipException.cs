@@ -9,18 +9,20 @@ public enum ZipExceptionType
     MalformedZip,
     UnsupportedCompression,
     EncryptedEntries,
-    FailedCrc
+    FailedCrc,
+
+    EntryLacksOriginalData
 }
 
 public class ZipException(ZipExceptionType type) : Exception
 {
-    public ZipExceptionType Type { get; private set; } = type;
-
-    [DoesNotReturn]
-    private static void Throw(ZipExceptionType type) => throw new ZipException(type);
+    public readonly ZipExceptionType Type = type;
 
     public static void Assert(bool expression, ZipExceptionType type)
     {
         if (!expression) Throw(type);
     }
+
+    [DoesNotReturn]
+    private static void Throw(ZipExceptionType type) => throw new ZipException(type);
 }

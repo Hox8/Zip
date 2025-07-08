@@ -1,18 +1,29 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
-		<TargetFramework>net8.0</TargetFramework>
+		<TargetFrameworks>net9.0;net8.0</TargetFrameworks>
+		<ImplicitUsings>disable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<IsAotCompatible>true</IsAotCompatible>
 	</PropertyGroup>
 
-	<PropertyGroup Condition=" '$(OS)'!='Windows_NT' ">
-		<DefineConstants>UNIX</DefineConstants>
+	<!-- Configurable preprocessor macros. -->
+	<PropertyGroup>
+		<!-- WITH_EXTRAFIELDS -->
+		<!-- Whether to include experimental (incomplete) extra field support. -->
+		<!--<DefineConstants>$(DefineConstants);WITH_EXTRAFIELDS</DefineConstants>-->
 	</PropertyGroup>
 
-	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
-		<DebugType>none</DebugType>
+	<!-- Automatic platform preprocessor macros. -->
+	<PropertyGroup>
+		<DefineConstants Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(DefineConstants);WINDOWS</DefineConstants>
+		<DefineConstants Condition="$([MSBuild]::IsOSPlatform('Linux'))">$(DefineConstants);UNIX;LINUX</DefineConstants>
+		<DefineConstants Condition="$([MSBuild]::IsOSPlatform('OSX'))">$(DefineConstants);UNIX;MACOSX</DefineConstants>
 	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="System.IO.Hashing" Version="9.0.6" />
+	</ItemGroup>
 
 </Project>

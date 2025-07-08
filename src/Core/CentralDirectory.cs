@@ -1,5 +1,5 @@
 ﻿using System.Runtime.InteropServices;
-using static Zip.Shared;
+using static Zip.Core.ZipConstants;
 
 namespace Zip.Core;
 
@@ -27,6 +27,11 @@ internal record struct CentralDirectory
     internal ushort _externalFileAttributesLow;
     internal ushort _externalFileAttributesHigh;
     internal int _relativeOffsetOfLocalHeader;
+
+    public CentralDirectory()
+    {
+        _tag = Tag;
+    }
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 2)]
@@ -34,8 +39,8 @@ internal record struct EndOfCentralDirectory
 {
     public const int Tag = 0x06054b50;
 
-    // These are used when we need to do a brute force
-    // search for the EndOfCentralDirectory in case of a zip comment
+    // These are used when we need to do a brute force search
+    // for the EndOfCentralDirectory in case of a zip comment
     public const byte Tag0 = Tag & 0xFF;
     public const byte Tag1 = (Tag >> 8) & 0xFF;
     public const byte Tag2 = (Tag >> 16) & 0xFF;
@@ -56,4 +61,9 @@ internal record struct EndOfCentralDirectory
     public int _centralDirectoryOffset;
     /// <summary>Length of the following string comment field.</summary>
     public ushort _commentLength;
+
+    public EndOfCentralDirectory()
+    {
+        _tag = Tag;
+    }
 }

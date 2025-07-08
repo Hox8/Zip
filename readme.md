@@ -8,7 +8,6 @@ Made with Apple's IPA archives in mind.
 - Per-entry compression
 - Parallel compression
 - Support for Windows and Unix platforms, including their respective file attributes and permissions
-- Uses Microsoft's System.IO.Compression deflator
 
 ## Does not support:
 - Encryption
@@ -16,4 +15,4 @@ Made with Apple's IPA archives in mind.
 - Zip64
 
 ## Credits
-Force-net for [Crc32.NET](https://github.com/force-net/Crc32.NET)
+- PKWARE's [ZIP specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT)
